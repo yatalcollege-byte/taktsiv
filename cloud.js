@@ -1,7 +1,7 @@
 import {firebaseConfig,householdId} from './firebase-config.js';
 const $=id=>document.getElementById(id);
 const KEY='my_monthly_budget_v1';
-const status=(s,msg)=>{$('cloudStatus').textContent=s;if(msg)$('cloudHelp').textContent=msg;};
+const status=(s,msg)=>{$('cloudStatus').textContent=s;if(msg!==undefined)$('cloudHelp').textContent=msg;console.info('[Budget cloud]',s,msg||'');};
 const valid=x=>x&&x.months&&typeof x.months==='object'&&!Array.isArray(x.months)&&Array.isArray(x.expenses);
 const clone=x=>JSON.parse(JSON.stringify(x));
 const equal=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
@@ -34,7 +34,8 @@ try{
   import('https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore.js')]);
  const app=initializeApp(firebaseConfig),auth=getAuth(app),store=getFirestore(app);
  const householdRef=doc(store,'households',householdId),budgetRef=doc(store,'households',householdId,'data','budget');
- let unsub=null,active=false,busy=false,base=null,queued=null,authUid=null;
+ let unsub=null,active=false,busy=false,base=null,queued=null,authUid=null,starting=false;
+ let lastAuthUid=null, authEpoch=0; // A single auth transition may start only once per UID.
  const stop=()=>{if(unsub){unsub();unsub=null}active=false;busy=false;queued=null;base=null;window.budgetCloud=null;freeze(true)};
  const putLocal=x=>{localStorage.setItem(KEY,JSON.stringify(x));};
  async function flush(){if(busy||!active||!queued)return;busy=true;
@@ -52,11 +53,13 @@ try{
   busy=false;
  }
  function queueSave(data){if(!active){status('לא מסונכרן','לא ניתן לשמור עד שהחיבור לענן פעיל.');return;}queued=clone(data);flush();}
- async function start(user){stop();authUid=user.uid;window.budgetUserEmail=user.email||'';$('cloudLogin').classList.add('hide');$('cloudConnected').classList.remove('hide');$('cloudAccount').textContent=user.email||'';status('מאמת הרשאות...');
+ async function start(user,epoch){if(starting)return;starting=true;stop();authUid=user.uid;window.budgetUserEmail=user.email||'';$('cloudLogin').classList.add('hide');$('cloudConnected').classList.remove('hide');$('cloudAccount').textContent=user.email||'';status('מאמת הרשאות...');
   try{
    const household=await getDoc(householdRef);
+   if(epoch!==authEpoch)return;
    if(!household.exists()||!Array.isArray(household.data().members)||!household.data().members.includes(user.uid))throw Error('החשבון אינו חבר בתקציב המשפחתי. בדקו UID במערך members.');
    const snap=await getDoc(budgetRef);
+   if(epoch!==authEpoch)return;
    let cloud=snap.exists()?snap.data().budget:null;
    if(cloud&&!valid(cloud))throw Error('פורמט הנתונים בענן אינו תקין');
    if(!cloud){
@@ -66,26 +69,36 @@ try{
     const initial=hasData&&confirm('אין תקציב בענן. נמצאו נתונים מקומיים במכשיר הזה. האם להעלות אותם כתקציב המשפחתי? בחרו ביטול להתחלה ריקה.')?local:{months:{},expenses:[]};
     cloud=await runTransaction(store,async tx=>{const d=await tx.get(budgetRef);if(d.exists())return d.data().budget;tx.set(budgetRef,{budget:initial,updatedAt:new Date().toISOString(),updatedBy:user.uid});return initial;});
    }
+   if(epoch!==authEpoch)return;
    base=clone(cloud);putLocal(cloud);
-   // Original app keeps an in-memory db; reload once to use authoritative cloud state.
-   const bootKey='budget_v3_boot_'+user.uid;
-   if(sessionStorage.getItem(bootKey)!==JSON.stringify(cloud)){
-    sessionStorage.setItem(bootKey,JSON.stringify(cloud));location.reload();return;
-   }
-   active=true;window.budgetCloud={queueSave};freeze(false);
-   status('מסונכרן','מחוברים לתקציב משפחתי משותף. כל משתמש נכנס בחשבון האישי שלו.');
+   active=true;window.budgetCloud={queueSave};
+   window.applyBudgetFromCloud(cloud);
+   freeze(false);
+   status('מסונכרן','מחוברים לתקציב משפחתי משותף.');
    unsub=onSnapshot(budgetRef,s=>{
-    if(!s.exists()||!active||busy||queued)return;
+    if(epoch!==authEpoch)return;
+    if(!s.exists()||!active)return;
     const remote=s.data().budget;
     if(!valid(remote)||equal(base,remote))return;
+    // While saving, do not replace unsaved local edits with a stale snapshot.
+    if(busy||queued)return;
     base=clone(remote);putLocal(remote);
-    // Refresh to synchronize all screen calculations with remote updates.
-    sessionStorage.setItem(bootKey,JSON.stringify(remote));location.reload();
-   },e=>{active=false;freeze(true);status('החיבור נותק',e.message)});
-  }catch(e){active=false;freeze(true);status('אין גישה לתקציב',e.message);}
+    window.applyBudgetFromCloud(remote);
+    status('מסונכרן','התקבל עדכון מהתקציב המשותף.');
+   },e=>{if(epoch!==authEpoch)return;active=false;freeze(true);status('החיבור נותק',e.message);console.error('[Budget cloud] listener',e)});
+  }catch(e){if(epoch===authEpoch){active=false;freeze(false);status('אין גישה לתקציב',e.message);console.error('[Budget cloud] startup',e)}}finally{starting=false;}
  }
- onAuthStateChanged(auth,user=>{stop();if(user)start(user);else{$('cloudLogin').classList.remove('hide');$('cloudConnected').classList.add('hide');status('נדרשת התחברות','התחברו כל אחד עם הדוא״ל והסיסמה האישיים.');}});
+ onAuthStateChanged(auth,user=>{
+  const uid=user?.uid||null;
+  // Firebase may notify repeatedly during token refresh. Do not restart Firestore listeners.
+  if(uid===lastAuthUid)return;
+  lastAuthUid=uid;
+  const epoch=++authEpoch;
+  stop();
+  if(user){start(user,epoch)}
+  else{$('cloudLogin').classList.remove('hide');$('cloudConnected').classList.add('hide');status('נדרשת התחברות','התחברו כל אחד עם הדוא״ל והסיסמה האישיים.');}
+ },e=>{console.error('[Budget cloud] auth observer',e);freeze(false);status('שגיאת אימות',e.message)});
  $('cloudSignIn').onclick=async()=>{try{status('מתחבר...');await signInWithEmailAndPassword(auth,$('cloudEmail').value.trim(),$('cloudPassword').value)}catch(e){status('שגיאת התחברות',e.message)}};
  $('cloudSignUp').classList.add('hide');
- $('cloudSignOut').onclick=async()=>{await signOut(auth);localStorage.removeItem(KEY);location.reload()};
-}catch(e){freeze(true);status('שגיאת טעינה','לא ניתן לטעון Firebase: '+e.message)}
+ $('cloudSignOut').onclick=async()=>{await signOut(auth);localStorage.removeItem(KEY);window.applyBudgetFromCloud({months:{},expenses:[]});freeze(true)};
+}catch(e){freeze(false);status('שגיאת טעינה','לא ניתן לטעון Firebase: '+e.message)}
